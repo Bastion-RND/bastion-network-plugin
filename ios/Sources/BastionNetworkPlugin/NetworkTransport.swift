@@ -166,6 +166,50 @@ final class NetworkTransport {
 
     // MARK: - TCP
 
+    /// `IP_BOUND_IF` из <netinet/in.h> (Darwin) — не экспортируется в Swift-модуль Darwin
+    /// напрямую, поэтому задаём значением. Используется, чтобы явно привязать сокет к
+    /// интерфейсу, у которого есть локальный маршрут до нужного хоста: iOS сам выбирает
+    /// "сеть по умолчанию" (например, сотовую вместо Wi-Fi), и сокет без привязки может
+    /// уйти не туда и не достучаться до устройства в локальной сети — тот же класс
+    /// проблемы, что и на Android (см. `findNetworkForHost` в BastionNetworkPlugin.java).
+    private static let ipBoundIf: Int32 = 25
+
+    /// Ищет интерфейс, чей локальный адрес+маска покрывают хост — то есть интерфейс,
+    /// с которого этот хост реально достижим напрямую. Не завязано на конкретный
+    /// тип интерфейса (Wi-Fi/сотовая/что угодно), поэтому остаётся универсальным.
+    private func interfaceIndex(forHost host: String) -> UInt32? {
+        var targetAddr = in_addr()
+        guard inet_pton(AF_INET, host, &targetAddr) == 1 else { return nil }
+
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else { return nil }
+        defer { freeifaddrs(ifaddrPtr) }
+
+        var pointer: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let current = pointer {
+            let interface = current.pointee
+            let flags = Int32(interface.ifa_flags)
+            let isUp = (flags & IFF_UP) != 0
+            let isLoopback = (flags & IFF_LOOPBACK) != 0
+
+            if isUp, !isLoopback,
+               let addrPtr = interface.ifa_addr, addrPtr.pointee.sa_family == UInt8(AF_INET),
+               let maskPtr = interface.ifa_netmask, maskPtr.pointee.sa_family == UInt8(AF_INET) {
+                let ifaceAddr = addrPtr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                let ifaceMask = maskPtr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+
+                if (ifaceAddr.s_addr & ifaceMask.s_addr) == (targetAddr.s_addr & ifaceMask.s_addr) {
+                    let index = if_nametoindex(interface.ifa_name)
+                    if index != 0 {
+                        return index
+                    }
+                }
+            }
+            pointer = interface.ifa_next
+        }
+        return nil
+    }
+
     func connectTCP(host: String, port: UInt16, authData: Data, completion: @escaping (Result<Int32, Error>) -> Void) {
         tcpQueue.async { [weak self] in
             guard let self = self else { return }
@@ -174,6 +218,10 @@ final class NetworkTransport {
             guard socketFD >= 0 else {
                 completion(.failure(NetworkTransportError.socketCreationFailed))
                 return
+            }
+
+            if var interfaceIndex = self.interfaceIndex(forHost: host) {
+                setsockopt(socketFD, IPPROTO_IP, Self.ipBoundIf, &interfaceIndex, socklen_t(MemoryLayout<UInt32>.size))
             }
 
             var addr = sockaddr_in()

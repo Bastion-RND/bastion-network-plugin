@@ -1,10 +1,15 @@
 package ru.bast.plugins.network;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.RouteInfo;
 import android.net.wifi.WifiManager;
 import android.util.Base64;
 import android.util.Log;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -197,6 +202,34 @@ public class BastionNetworkPlugin extends Plugin {
         return result;
     }
 
+    /**
+     * Ищет среди всех активных сетей ту, у которой есть локальный (не дефолтный) маршрут
+     * до нужного хоста, и биндит сокет на неё. Это нужно, потому что Android выбирает
+     * "сеть по умолчанию" по своим критериям (например, предпочитает мобильный интернет
+     * Wi-Fi без validated-доступа в интернет) — обычный сокет без привязки уедет через неё
+     * и не сможет достучаться до устройства в локальной сети. Метод не завязан на
+     * конкретный транспорт (Wi-Fi/Ethernet/что угодно) — работает с любой сетью, реально
+     * имеющей маршрут до хоста, поэтому плагин остаётся универсальным.
+     */
+    @Nullable
+    private Network findNetworkForHost(InetAddress host) {
+        ConnectivityManager connectivityManager =
+            (ConnectivityManager) getContext().getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivityManager == null) return null;
+
+        for (Network network : connectivityManager.getAllNetworks()) {
+            LinkProperties linkProperties = connectivityManager.getLinkProperties(network);
+            if (linkProperties == null) continue;
+
+            for (RouteInfo route : linkProperties.getRoutes()) {
+                if (!route.isDefaultRoute() && route.matches(host)) {
+                    return network;
+                }
+            }
+        }
+        return null;
+    }
+
     @PluginMethod
     public void connectTCP(PluginCall call) {
         String host = call.getString("ip");
@@ -212,8 +245,14 @@ public class BastionNetworkPlugin extends Plugin {
         executor.execute(() -> {
             int linkId = linkIdCounter.getAndIncrement();
             try {
+                InetAddress hostAddress = InetAddress.getByName(host);
+                Network targetNetwork = findNetworkForHost(hostAddress);
+
                 Socket socket = new Socket();
-                socket.connect(new InetSocketAddress(host, port), 10_000);
+                if (targetNetwork != null) {
+                    targetNetwork.bindSocket(socket);
+                }
+                socket.connect(new InetSocketAddress(hostAddress, port), 10_000);
                 socket.setKeepAlive(true);
 
                 OutputStream out = socket.getOutputStream();
