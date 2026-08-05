@@ -1,0 +1,104 @@
+import Foundation
+import Capacitor
+
+@objc(BastionNetworkPlugin)
+public class BastionNetworkPlugin: CAPPlugin {
+    private var transport: NetworkTransport!
+
+    override public func load() {
+        transport = NetworkTransport(
+            portListTransmit: readPortListConfig("portListTransmit"),
+            portListReceive: readPortListConfig("portListReceive")
+        )
+
+        transport.onReceiveUDP = { [weak self] ip, port, data in
+            let result: [String: Any] = [
+                "ip": ip,
+                "port": Int(port),
+                "data": data.base64EncodedString(),
+            ]
+            self?.notifyListeners("receiveUDP", data: result)
+        }
+
+        transport.onReceiveTCP = { [weak self] linkId, data in
+            let result: [String: Any] = [
+                "linkId": Int(linkId),
+                "data": data.base64EncodedString(),
+            ]
+            self?.notifyListeners("receiveTCP", data: result)
+        }
+
+        transport.onDisconnectTCP = { [weak self] linkId in
+            self?.notifyListeners("disconnectTCP", data: ["linkId": Int(linkId)])
+        }
+
+        transport.start()
+    }
+
+    private func readPortListConfig(_ key: String) -> [UInt16]? {
+        guard let values: [Int] = getConfig().getArray(key) else { return nil }
+        return values.map { UInt16($0) }
+    }
+
+    @objc func sendBroadcastUDP(_ call: CAPPluginCall) {
+        guard let base64Data = call.getString("data"), let data = Data(base64Encoded: base64Data) else {
+            call.reject("data is required")
+            return
+        }
+
+        switch transport.sendBroadcastUDP(data: data) {
+        case .success:
+            call.resolve()
+        case .failure(.portsNotConfigured):
+            call.reject("portListTransmit is not configured in capacitor.config.json for BastionNetworkPlugin")
+        case .failure(let error):
+            call.reject("UDP broadcast socket error", nil, error)
+        }
+    }
+
+    @objc func connectTCP(_ call: CAPPluginCall) {
+        guard let host = call.getString("ip"),
+              let port = call.getInt("port"),
+              let base64Data = call.getString("data"),
+              let authData = Data(base64Encoded: base64Data) else {
+            call.reject("ip, port and data are required")
+            return
+        }
+
+        transport.connectTCP(host: host, port: UInt16(port), authData: authData) { result in
+            switch result {
+            case .success(let linkId):
+                call.resolve(["linkId": Int(linkId)])
+            case .failure(let error):
+                call.reject("TCP connection error", nil, error)
+            }
+        }
+    }
+
+    @objc func sendTCP(_ call: CAPPluginCall) {
+        guard let linkId = call.getInt("linkId"),
+              let base64Data = call.getString("data"),
+              let data = Data(base64Encoded: base64Data) else {
+            call.reject("linkId and data are required")
+            return
+        }
+
+        transport.sendTCP(linkId: Int32(linkId), data: data) { result in
+            switch result {
+            case .success:
+                call.resolve()
+            case .failure(let error):
+                call.reject("TCP transmit error", nil, error)
+            }
+        }
+    }
+
+    @objc func disconnectTCP(_ call: CAPPluginCall) {
+        guard let linkId = call.getInt("linkId") else {
+            call.reject("linkId is required")
+            return
+        }
+        transport.disconnectTCP(linkId: Int32(linkId))
+        call.resolve()
+    }
+}
