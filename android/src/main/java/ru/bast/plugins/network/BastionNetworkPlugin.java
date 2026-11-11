@@ -274,7 +274,6 @@ public class BastionNetworkPlugin extends Plugin {
         }
         byte[] initialData = Base64.decode(base64Data, Base64.NO_WRAP);
 
-        boolean deferEvents = Boolean.TRUE.equals(call.getBoolean("deferEvents", false));
         executor.execute(() -> {
             int linkId = linkIdCounter.getAndIncrement();
             Socket socket = new Socket();
@@ -325,7 +324,7 @@ public class BastionNetworkPlugin extends Plugin {
                 JSObject result = new JSObject();
                 result.put("linkId", linkId);
                 call.resolve(result);
-                if (!deferEvents) startTcpReader(linkId, socket);
+                startTcpReader(linkId, socket);
             } catch (IOException | RuntimeException e) {
                 call.reject("TCP connection error", e);
             } finally {
@@ -342,15 +341,6 @@ public class BastionNetworkPlugin extends Plugin {
                 executor.execute(() -> readTcpLoop(linkId, socket));
             }
         }
-    }
-
-    @PluginMethod
-    public void resumeTCP(PluginCall call) {
-        Integer linkId = call.getInt("linkId");
-        Socket socket = linkId == null ? null : tcpConnections.get(linkId);
-        if (socket == null) { call.reject("Unknown linkId " + linkId); return; }
-        startTcpReader(linkId, socket);
-        call.resolve();
     }
 
     private void readTcpLoop(int linkId, Socket socket) {

@@ -1,6 +1,6 @@
 {
   "name": "@bs-solutions/bastion-network-plugin",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Raw TCP/UDP socket plugin for Capacitor 6 and higher (LAN device discovery and connection)",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

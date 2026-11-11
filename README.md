@@ -70,7 +70,6 @@ TCP settings are optional. Existing callers can omit them:
 
 `tcpConnectTimeoutMs` limits connection establishment and the initial write. `tcpNoDelay` controls TCP_NODELAY. The three keepalive values set the idle time, probe interval, and number of probes; set all three to positive integers to configure them, or omit them to use operating system defaults. Keepalive remains enabled. On Android the keepalive parameters use a bundled native library.
 
-To prevent events from arriving before a consumer registers the returned link, pass `deferEvents: true` to `connectTCP` and call `resumeTCP({ linkId })` when ready. Until then data remains in the socket receive buffer and the remote peer may be subject to TCP backpressure. Disconnecting a paused link closes it normally.
 
 ## API
 

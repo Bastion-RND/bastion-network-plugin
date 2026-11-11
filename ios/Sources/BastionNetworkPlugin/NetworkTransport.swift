@@ -230,7 +230,7 @@ final class NetworkTransport {
         return nil
     }
 
-    func connectTCP(host: String, port: UInt16, initialData: Data, deferEvents: Bool,
+    func connectTCP(host: String, port: UInt16, initialData: Data,
                     completion: @escaping (Result<Int32, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -329,19 +329,17 @@ final class NetworkTransport {
             guard let linkId = linkId else { completion(.failure(NetworkTransportError.connectFailed)); return }
             registered = true
             completion(.success(linkId))
-            if !deferEvents { _ = self.resumeTCP(linkId: linkId) }
+            self.startTcpReader(linkId: linkId)
         }
     }
 
-    @discardableResult
-    func resumeTCP(linkId: Int32) -> Bool {
+    private func startTcpReader(linkId: Int32) {
         tcpQueue.sync {
-            guard let socketFD = tcpConnections[linkId] else { return false }
+            guard let socketFD = tcpConnections[linkId] else { return }
             if tcpReaders.insert(linkId).inserted {
                 let thread = Thread { self.tcpReadLoop(linkId: linkId, socketFD: socketFD) }
                 thread.start()
             }
-            return true
         }
     }
 

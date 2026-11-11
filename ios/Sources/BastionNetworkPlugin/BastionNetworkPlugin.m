@@ -5,7 +5,6 @@
 CAP_PLUGIN(BastionNetworkPlugin, "BastionNetworkPlugin",
     CAP_PLUGIN_METHOD(sendBroadcastUDP, CAPPluginReturnPromise);
     CAP_PLUGIN_METHOD(connectTCP, CAPPluginReturnPromise);
-    CAP_PLUGIN_METHOD(resumeTCP, CAPPluginReturnPromise);
     CAP_PLUGIN_METHOD(sendTCP, CAPPluginReturnPromise);
     CAP_PLUGIN_METHOD(disconnectTCP, CAPPluginReturnPromise);
 )

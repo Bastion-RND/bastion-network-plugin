@@ -72,7 +72,7 @@ public class BastionNetworkPlugin: CAPPlugin {
             return
         }
 
-        transport.connectTCP(host: host, port: UInt16(port), initialData: initialData, deferEvents: call.getBool("deferEvents") ?? false) { result in
+        transport.connectTCP(host: host, port: UInt16(port), initialData: initialData) { result in
             switch result {
             case .success(let linkId):
                 call.resolve(["linkId": Int(linkId)])
@@ -80,14 +80,6 @@ public class BastionNetworkPlugin: CAPPlugin {
                 call.reject("TCP connection error", nil, error)
             }
         }
-    }
-
-    @objc func resumeTCP(_ call: CAPPluginCall) {
-        guard let linkId = call.getInt("linkId"), transport.resumeTCP(linkId: Int32(linkId)) else {
-            call.reject("Unknown linkId")
-            return
-        }
-        call.resolve()
     }
 
     @objc func sendTCP(_ call: CAPPluginCall) {
