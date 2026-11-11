@@ -21,14 +21,29 @@ final class NetworkTransport {
 
     private let portListTransmit: [UInt16]?
     private let portListReceive: [UInt16]?
+    private let tcpNoDelay: Bool
+    private let tcpConnectTimeoutMs: Int
+    private let tcpKeepAliveIdleSeconds: Int32
+    private let tcpKeepAliveIntervalSeconds: Int32
+    private let tcpKeepAliveProbeCount: Int32
     private var udpSockets: [Int32] = []
     private var tcpConnections: [Int32: Int32] = [:]
+    private var pendingConnections: Set<Int32> = []
+    private var tcpReaders: Set<Int32> = []
+    private var stopped = false
     private let tcpQueue = DispatchQueue(label: "ru.bast.plugins.network.tcp")
     private var linkIdCounter: Int32 = 0
 
-    init(portListTransmit: [UInt16]?, portListReceive: [UInt16]?) {
+    init(portListTransmit: [UInt16]?, portListReceive: [UInt16]?, tcpNoDelay: Bool,
+         tcpConnectTimeoutMs: Int, tcpKeepAliveIdleSeconds: Int32,
+         tcpKeepAliveIntervalSeconds: Int32, tcpKeepAliveProbeCount: Int32) {
         self.portListTransmit = portListTransmit
         self.portListReceive = portListReceive
+        self.tcpNoDelay = tcpNoDelay
+        self.tcpConnectTimeoutMs = max(1, tcpConnectTimeoutMs)
+        self.tcpKeepAliveIdleSeconds = tcpKeepAliveIdleSeconds
+        self.tcpKeepAliveIntervalSeconds = tcpKeepAliveIntervalSeconds
+        self.tcpKeepAliveProbeCount = tcpKeepAliveProbeCount
     }
 
     func start() {
@@ -45,8 +60,11 @@ final class NetworkTransport {
         udpSockets.removeAll()
 
         tcpQueue.sync {
-            for (_, socketFD) in tcpConnections {
-                close(socketFD)
+            stopped = true
+            for socketFD in pendingConnections { shutdown(socketFD, SHUT_RDWR) }
+            for (linkId, socketFD) in tcpConnections {
+                shutdown(socketFD, SHUT_RDWR)
+                if !tcpReaders.contains(linkId) { close(socketFD) }
             }
             tcpConnections.removeAll()
         }
@@ -85,7 +103,7 @@ final class NetworkTransport {
     }
 
     private func udpReceiveLoop(socketFD: Int32) {
-        var buffer = [UInt8](repeating: 0, count: Self.readBufferSize)
+        var buffer = [UInt8](repeating: 0, count: 65535)
         while true {
             var senderAddr = sockaddr_in()
             var senderLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -95,7 +113,7 @@ final class NetworkTransport {
                     recvfrom(socketFD, &buffer, buffer.count, 0, sockaddrPtr, &senderLen)
                 }
             }
-            if bytesRead <= 0 { break }
+            if bytesRead < 0 { break }
 
             let data = Data(bytes: buffer, count: bytesRead)
             var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
@@ -119,6 +137,7 @@ final class NetworkTransport {
         var broadcastEnable: Int32 = 1
         setsockopt(socketFD, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, socklen_t(MemoryLayout<Int32>.size))
 
+        var hadError = false
         for address in getBroadcastAddresses() {
             for port in portListTransmit {
                 var addr = sockaddr_in()
@@ -126,17 +145,18 @@ final class NetworkTransport {
                 addr.sin_port = port.bigEndian
                 inet_pton(AF_INET, address, &addr.sin_addr)
 
-                _ = data.withUnsafeBytes { rawBuffer -> Int in
+                let sent = data.withUnsafeBytes { rawBuffer -> Int in
                     withUnsafePointer(to: &addr) { addrPtr -> Int in
                         addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
                             sendto(socketFD, rawBuffer.baseAddress, data.count, 0, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
                         }
                     }
                 }
+                if sent != data.count { hadError = true }
             }
         }
 
-        return .success(())
+        return hadError ? .failure(.writeFailed) : .success(())
     }
 
     private func getBroadcastAddresses() -> [String] {
@@ -210,57 +230,118 @@ final class NetworkTransport {
         return nil
     }
 
-    func connectTCP(host: String, port: UInt16, authData: Data, completion: @escaping (Result<Int32, Error>) -> Void) {
-        tcpQueue.async { [weak self] in
+    func connectTCP(host: String, port: UInt16, initialData: Data, deferEvents: Bool,
+                    completion: @escaping (Result<Int32, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-
             let socketFD = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-            guard socketFD >= 0 else {
-                completion(.failure(NetworkTransportError.socketCreationFailed))
-                return
+            guard socketFD >= 0 else { completion(.failure(NetworkTransportError.socketCreationFailed)); return }
+            let accepted = self.tcpQueue.sync { () -> Bool in
+                guard !self.stopped else { return false }
+                self.pendingConnections.insert(socketFD)
+                return true
             }
-
-            if var interfaceIndex = self.interfaceIndex(forHost: host) {
-                setsockopt(socketFD, IPPROTO_IP, Self.ipBoundIf, &interfaceIndex, socklen_t(MemoryLayout<UInt32>.size))
+            guard accepted else { close(socketFD); completion(.failure(NetworkTransportError.connectFailed)); return }
+            var registered = false
+            defer {
+                self.tcpQueue.sync { _ = self.pendingConnections.remove(socketFD) }
+                if !registered { close(socketFD) }
             }
-
+            if var index = self.interfaceIndex(forHost: host) {
+                setsockopt(socketFD, IPPROTO_IP, Self.ipBoundIf, &index, socklen_t(MemoryLayout<UInt32>.size))
+            }
+            var noDelay: Int32 = self.tcpNoDelay ? 1 : 0
+            var keepAlive: Int32 = 1
+            var noSigPipe: Int32 = 1
+            guard setsockopt(socketFD, IPPROTO_TCP, TCP_NODELAY, &noDelay, socklen_t(MemoryLayout<Int32>.size)) == 0,
+                  setsockopt(socketFD, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, socklen_t(MemoryLayout<Int32>.size)) == 0,
+                  setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                completion(.failure(NetworkTransportError.socketConfigurationFailed)); return
+            }
+            if self.tcpKeepAliveIdleSeconds > 0 && self.tcpKeepAliveIntervalSeconds > 0 && self.tcpKeepAliveProbeCount > 0 {
+                var idle = self.tcpKeepAliveIdleSeconds
+                var interval = self.tcpKeepAliveIntervalSeconds
+                var count = self.tcpKeepAliveProbeCount
+                guard setsockopt(socketFD, IPPROTO_TCP, TCP_KEEPALIVE, &idle, socklen_t(MemoryLayout<Int32>.size)) == 0,
+                      setsockopt(socketFD, IPPROTO_TCP, TCP_KEEPINTVL, &interval, socklen_t(MemoryLayout<Int32>.size)) == 0,
+                      setsockopt(socketFD, IPPROTO_TCP, TCP_KEEPCNT, &count, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                    completion(.failure(NetworkTransportError.socketConfigurationFailed)); return
+                }
+            }
+            let flags = fcntl(socketFD, F_GETFL, 0)
+            guard flags >= 0, fcntl(socketFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
+                completion(.failure(NetworkTransportError.socketConfigurationFailed)); return
+            }
+            let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(self.tcpConnectTimeoutMs) * 1_000_000
+            func waitWritable() -> Bool {
+                while true {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if now >= deadline { return false }
+                    let remaining = Int32(min((deadline - now + 999_999) / 1_000_000, UInt64(Int32.max)))
+                    var descriptor = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
+                    let result = poll(&descriptor, 1, remaining)
+                    if result > 0 { return (descriptor.revents & Int16(POLLOUT)) != 0 }
+                    if result == 0 || errno != EINTR { return false }
+                }
+            }
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
             addr.sin_port = port.bigEndian
-            inet_pton(AF_INET, host, &addr.sin_addr)
-
-            let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else {
+                completion(.failure(NetworkTransportError.connectFailed)); return
+            }
+            let result = withUnsafePointer(to: &addr) { ptr in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     connect(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
-            guard connectResult == 0 else {
-                close(socketFD)
-                completion(.failure(NetworkTransportError.connectFailed))
-                return
+            if result != 0 {
+                guard errno == EINPROGRESS, waitWritable() else {
+                    completion(.failure(NetworkTransportError.connectFailed)); return
+                }
+                var error: Int32 = 0
+                var length = socklen_t(MemoryLayout<Int32>.size)
+                guard getsockopt(socketFD, SOL_SOCKET, SO_ERROR, &error, &length) == 0, error == 0 else {
+                    completion(.failure(NetworkTransportError.connectFailed)); return
+                }
             }
-
-            var keepAlive: Int32 = 1
-            setsockopt(socketFD, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, socklen_t(MemoryLayout<Int32>.size))
-
-            let writeOk = authData.withUnsafeBytes { rawBuffer -> Bool in
-                write(socketFD, rawBuffer.baseAddress, authData.count) == authData.count
+            let written = initialData.withUnsafeBytes { raw -> Bool in
+                var offset = 0
+                while offset < raw.count {
+                    guard waitWritable(), let base = raw.baseAddress else { return false }
+                    let size = write(socketFD, base.advanced(by: offset), raw.count - offset)
+                    if size > 0 { offset += size }
+                    else if size < 0 && (errno == EINTR || errno == EAGAIN) { continue }
+                    else { return false }
+                }
+                return true
             }
-            guard writeOk else {
-                close(socketFD)
-                completion(.failure(NetworkTransportError.writeFailed))
-                return
+            guard written, fcntl(socketFD, F_SETFL, flags) == 0 else {
+                completion(.failure(NetworkTransportError.writeFailed)); return
             }
-
-            self.linkIdCounter += 1
-            let linkId = self.linkIdCounter
-            self.tcpConnections[linkId] = socketFD
-
+            let linkId: Int32? = self.tcpQueue.sync {
+                guard !self.stopped else { return nil }
+                self.pendingConnections.remove(socketFD)
+                self.linkIdCounter += 1
+                self.tcpConnections[self.linkIdCounter] = socketFD
+                return self.linkIdCounter
+            }
+            guard let linkId = linkId else { completion(.failure(NetworkTransportError.connectFailed)); return }
+            registered = true
             completion(.success(linkId))
+            if !deferEvents { _ = self.resumeTCP(linkId: linkId) }
+        }
+    }
 
-            let thread = Thread { [weak self] in self?.tcpReadLoop(linkId: linkId, socketFD: socketFD) }
-            thread.name = "BastionNetworkPlugin.tcp.\(linkId)"
-            thread.start()
+    @discardableResult
+    func resumeTCP(linkId: Int32) -> Bool {
+        tcpQueue.sync {
+            guard let socketFD = tcpConnections[linkId] else { return false }
+            if tcpReaders.insert(linkId).inserted {
+                let thread = Thread { self.tcpReadLoop(linkId: linkId, socketFD: socketFD) }
+                thread.start()
+            }
+            return true
         }
     }
 
@@ -274,11 +355,14 @@ final class NetworkTransport {
             onReceiveTCP?(linkId, data)
         }
 
-        tcpQueue.async { [weak self] in
-            self?.tcpConnections.removeValue(forKey: linkId)
+        tcpQueue.async {
+            self.tcpReaders.remove(linkId)
+            if self.tcpConnections[linkId] == socketFD {
+                self.tcpConnections.removeValue(forKey: linkId)
+            }
+            close(socketFD)
+            self.onDisconnectTCP?(linkId)
         }
-        close(socketFD)
-        onDisconnectTCP?(linkId)
     }
 
     func sendTCP(linkId: Int32, data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -288,7 +372,15 @@ final class NetworkTransport {
                 return
             }
             let writeOk = data.withUnsafeBytes { rawBuffer -> Bool in
-                write(socketFD, rawBuffer.baseAddress, data.count) == data.count
+                var offset = 0
+                while offset < rawBuffer.count {
+                    guard let base = rawBuffer.baseAddress else { return false }
+                    let written = write(socketFD, base.advanced(by: offset), rawBuffer.count - offset)
+                    if written > 0 { offset += written }
+                    else if written < 0 && errno == EINTR { continue }
+                    else { return false }
+                }
+                return true
             }
             completion(writeOk ? .success(()) : .failure(NetworkTransportError.writeFailed))
         }
@@ -297,7 +389,11 @@ final class NetworkTransport {
     func disconnectTCP(linkId: Int32) {
         tcpQueue.async { [weak self] in
             guard let socketFD = self?.tcpConnections.removeValue(forKey: linkId) else { return }
-            close(socketFD)
+            shutdown(socketFD, SHUT_RDWR)
+            if self?.tcpReaders.contains(linkId) != true {
+                close(socketFD)
+                self?.onDisconnectTCP?(linkId)
+            }
         }
     }
 }
@@ -305,6 +401,7 @@ final class NetworkTransport {
 enum NetworkTransportError: Error {
     case portsNotConfigured
     case socketCreationFailed
+    case socketConfigurationFailed
     case connectFailed
     case writeFailed
     case unknownLinkId

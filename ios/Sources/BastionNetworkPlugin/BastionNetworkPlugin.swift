@@ -5,10 +5,17 @@ import Capacitor
 public class BastionNetworkPlugin: CAPPlugin {
     private var transport: NetworkTransport!
 
+    deinit { transport?.stop() }
+
     override public func load() {
         transport = NetworkTransport(
             portListTransmit: readPortListConfig("portListTransmit"),
-            portListReceive: readPortListConfig("portListReceive")
+            portListReceive: readPortListConfig("portListReceive"),
+            tcpNoDelay: getConfig().getBoolean("tcpNoDelay", false),
+            tcpConnectTimeoutMs: getConfig().getInt("tcpConnectTimeoutMs", 10000),
+            tcpKeepAliveIdleSeconds: Int32(getConfig().getInt("tcpKeepAliveIdleSeconds", 0)),
+            tcpKeepAliveIntervalSeconds: Int32(getConfig().getInt("tcpKeepAliveIntervalSeconds", 0)),
+            tcpKeepAliveProbeCount: Int32(getConfig().getInt("tcpKeepAliveProbeCount", 0))
         )
 
         transport.onReceiveUDP = { [weak self] ip, port, data in
@@ -60,12 +67,12 @@ public class BastionNetworkPlugin: CAPPlugin {
         guard let host = call.getString("ip"),
               let port = call.getInt("port"),
               let base64Data = call.getString("data"),
-              let authData = Data(base64Encoded: base64Data) else {
+              let initialData = Data(base64Encoded: base64Data) else {
             call.reject("ip, port and data are required")
             return
         }
 
-        transport.connectTCP(host: host, port: UInt16(port), authData: authData) { result in
+        transport.connectTCP(host: host, port: UInt16(port), initialData: initialData, deferEvents: call.getBool("deferEvents") ?? false) { result in
             switch result {
             case .success(let linkId):
                 call.resolve(["linkId": Int(linkId)])
@@ -73,6 +80,14 @@ public class BastionNetworkPlugin: CAPPlugin {
                 call.reject("TCP connection error", nil, error)
             }
         }
+    }
+
+    @objc func resumeTCP(_ call: CAPPluginCall) {
+        guard let linkId = call.getInt("linkId"), transport.resumeTCP(linkId: Int32(linkId)) else {
+            call.reject("Unknown linkId")
+            return
+        }
+        call.resolve()
     }
 
     @objc func sendTCP(_ call: CAPPluginCall) {

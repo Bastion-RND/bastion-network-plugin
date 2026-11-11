@@ -27,6 +27,7 @@ export type TConnectTcpOptions = {
   ip: string;
   port: number;
   data: string;
+  deferEvents?: boolean;
 };
 
 export type TConnectTcpResult = {
@@ -48,6 +49,8 @@ export interface IBastionNetworkPlugin {
 
   /** Открыть TCP-соединение и отправить первым пакетом данные авторизации. */
   connectTCP(options: TConnectTcpOptions): Promise<TConnectTcpResult>;
+
+  resumeTCP(options: TDisconnectTcpOptions): Promise<void>;
 
   /** Закрыть TCP-соединение по linkId. */
   disconnectTCP(options: TDisconnectTcpOptions): Promise<void>;

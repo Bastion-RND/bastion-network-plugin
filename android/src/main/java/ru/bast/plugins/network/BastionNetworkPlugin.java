@@ -6,6 +6,8 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.RouteInfo;
 import android.net.wifi.WifiManager;
+import android.os.ParcelFileDescriptor;
+import android.os.Build;
 import android.util.Base64;
 import android.util.Log;
 import androidx.annotation.NonNull;
@@ -33,7 +35,12 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 
 /**
@@ -45,23 +52,42 @@ import org.json.JSONArray;
 @CapacitorPlugin(name = "BastionNetworkPlugin")
 public class BastionNetworkPlugin extends Plugin {
 
+    static { System.loadLibrary("bastion_network"); }
+
+    private static native int configureKeepAlive(int fd, int idle, int interval, int count);
+
     private static final String TAG = "BastionNetworkPlugin";
     private static final int TCP_READ_BUFFER_SIZE = 8192;
 
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final Map<Integer, Socket> tcpConnections = new ConcurrentHashMap<>();
+    private final Set<Socket> pendingConnections = ConcurrentHashMap.newKeySet();
+    private final Map<Socket, ParcelFileDescriptor> borrowedDescriptors = new ConcurrentHashMap<>();
+    private final Set<Integer> tcpReaders = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final Object lifecycleLock = new Object();
     private final AtomicInteger linkIdCounter = new AtomicInteger(1);
     private final List<DatagramSocket> udpReceiveSockets = new ArrayList<>();
     private WifiManager.MulticastLock multicastLock;
     private volatile boolean destroyed = false;
     private int[] portListTransmit;
     private int[] portListReceive;
+    private boolean tcpNoDelay;
+    private int tcpConnectTimeoutMs;
+    private int tcpKeepAliveIdleSeconds;
+    private int tcpKeepAliveIntervalSeconds;
+    private int tcpKeepAliveProbeCount;
 
     @Override
     public void load() {
         super.load();
         portListTransmit = readPortListConfig("portListTransmit");
         portListReceive = readPortListConfig("portListReceive");
+        tcpNoDelay = getConfig().getBoolean("tcpNoDelay", false);
+        tcpConnectTimeoutMs = Math.max(1, getConfig().getInt("tcpConnectTimeoutMs", 10000));
+        tcpKeepAliveIdleSeconds = getConfig().getInt("tcpKeepAliveIdleSeconds", 0);
+        tcpKeepAliveIntervalSeconds = getConfig().getInt("tcpKeepAliveIntervalSeconds", 0);
+        tcpKeepAliveProbeCount = getConfig().getInt("tcpKeepAliveProbeCount", 0);
         acquireMulticastLock();
         if (portListReceive != null) {
             startUdpListeners();
@@ -89,15 +115,18 @@ public class BastionNetworkPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         super.handleOnDestroy();
-        destroyed = true;
+        synchronized (lifecycleLock) {
+            destroyed = true;
+            for (Socket socket : pendingConnections) closeQuietly(socket);
+            pendingConnections.clear();
+            for (Socket socket : tcpConnections.values()) closeQuietly(socket);
+            tcpConnections.clear();
+        }
+        scheduler.shutdownNow();
         for (DatagramSocket socket : udpReceiveSockets) {
             socket.close();
         }
         udpReceiveSockets.clear();
-        for (Socket socket : tcpConnections.values()) {
-            closeQuietly(socket);
-        }
-        tcpConnections.clear();
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
         }
@@ -126,7 +155,7 @@ public class BastionNetworkPlugin extends Plugin {
             udpReceiveSockets.add(socket);
             Log.i(TAG, "UDP listener starts 0.0.0.0:" + port);
 
-            byte[] buffer = new byte[TCP_READ_BUFFER_SIZE];
+            byte[] buffer = new byte[65535];
             while (!socket.isClosed()) {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
@@ -164,6 +193,7 @@ public class BastionNetworkPlugin extends Plugin {
             List<InetAddress> broadcastAddresses = getBroadcastAddresses();
             try (DatagramSocket socket = new DatagramSocket()) {
                 socket.setBroadcast(true);
+                boolean hadError = false;
                 for (InetAddress address : broadcastAddresses) {
                     for (int port : portListTransmit) {
                         try {
@@ -171,10 +201,12 @@ public class BastionNetworkPlugin extends Plugin {
                             Log.i(TAG, "UDP broadcast send successfully " + address.getHostAddress() + ":" + port);
                         } catch (IOException e) {
                             Log.e(TAG, "UDP broadcast send error " + address.getHostAddress() + ":" + port, e);
+                            hadError = true;
                         }
                     }
                 }
-                call.resolve();
+                if (hadError) call.reject("UDP broadcast send error");
+                else call.resolve();
             } catch (IOException e) {
                 call.reject("UDP broadcast socket error", e);
             }
@@ -240,38 +272,85 @@ public class BastionNetworkPlugin extends Plugin {
             call.reject("ip, port and data are required");
             return;
         }
-        byte[] authData = Base64.decode(base64Data, Base64.NO_WRAP);
+        byte[] initialData = Base64.decode(base64Data, Base64.NO_WRAP);
 
+        boolean deferEvents = Boolean.TRUE.equals(call.getBoolean("deferEvents", false));
         executor.execute(() -> {
             int linkId = linkIdCounter.getAndIncrement();
+            Socket socket = new Socket();
+            ScheduledFuture<?> timeout;
+            AtomicBoolean finished = new AtomicBoolean(false);
+            synchronized (lifecycleLock) {
+                if (destroyed) { closeQuietly(socket); call.reject("Plugin destroyed"); return; }
+                pendingConnections.add(socket);
+                timeout = scheduler.schedule(() -> {
+                    synchronized (socket) { if (!finished.get()) closeQuietly(socket); }
+                }, tcpConnectTimeoutMs, TimeUnit.MILLISECONDS);
+            }
+            boolean registered = false;
             try {
                 InetAddress hostAddress = InetAddress.getByName(host);
                 Network targetNetwork = findNetworkForHost(hostAddress);
-
-                Socket socket = new Socket();
-                if (targetNetwork != null) {
-                    targetNetwork.bindSocket(socket);
-                }
-                socket.connect(new InetSocketAddress(hostAddress, port), 10_000);
+                if (targetNetwork != null) targetNetwork.bindSocket(socket);
+                socket.connect(new InetSocketAddress(hostAddress, port), tcpConnectTimeoutMs);
                 socket.setKeepAlive(true);
-
+                socket.setTcpNoDelay(tcpNoDelay);
+                if (tcpKeepAliveIdleSeconds > 0 && tcpKeepAliveIntervalSeconds > 0 && tcpKeepAliveProbeCount > 0) {
+                    ParcelFileDescriptor borrowed = ParcelFileDescriptor.fromSocket(socket);
+                    if (borrowed == null) throw new IOException("Unable to access TCP socket");
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        try (ParcelFileDescriptor descriptor = borrowed) {
+                            if (configureKeepAlive(descriptor.getFd(), tcpKeepAliveIdleSeconds, tcpKeepAliveIntervalSeconds, tcpKeepAliveProbeCount) != 0)
+                                throw new IOException("Unable to configure TCP keepalive");
+                        }
+                    } else {
+                        borrowedDescriptors.put(socket, borrowed);
+                        int result = configureKeepAlive(borrowed.getFd(), tcpKeepAliveIdleSeconds, tcpKeepAliveIntervalSeconds, tcpKeepAliveProbeCount);
+                        if (result != 0) throw new IOException("Unable to configure TCP keepalive");
+                    }
+                }
                 OutputStream out = socket.getOutputStream();
-                out.write(authData);
+                out.write(initialData);
                 out.flush();
-
-                tcpConnections.put(linkId, socket);
-                Log.i(TAG, "TCP connected " + host + ":" + port);
-
+                synchronized (lifecycleLock) {
+                    synchronized (socket) {
+                        if (destroyed || socket.isClosed()) throw new IOException("TCP connection timeout");
+                        finished.set(true);
+                        timeout.cancel(false);
+                        pendingConnections.remove(socket);
+                        tcpConnections.put(linkId, socket);
+                        registered = true;
+                    }
+                }
                 JSObject result = new JSObject();
                 result.put("linkId", linkId);
                 call.resolve(result);
-
-                readTcpLoop(linkId, socket);
-            } catch (IOException e) {
-                Log.e(TAG, "TCP connection error " + host + ":" + port, e);
+                if (!deferEvents) startTcpReader(linkId, socket);
+            } catch (IOException | RuntimeException e) {
                 call.reject("TCP connection error", e);
+            } finally {
+                timeout.cancel(false);
+                pendingConnections.remove(socket);
+                if (!registered) closeQuietly(socket);
             }
         });
+    }
+
+    private void startTcpReader(int linkId, Socket socket) {
+        synchronized (lifecycleLock) {
+            if (tcpConnections.get(linkId) == socket && tcpReaders.add(linkId)) {
+                executor.execute(() -> readTcpLoop(linkId, socket));
+            }
+        }
+    }
+
+    @PluginMethod
+    public void resumeTCP(PluginCall call) {
+        Integer linkId = call.getInt("linkId");
+        Socket socket = linkId == null ? null : tcpConnections.get(linkId);
+        if (socket == null) { call.reject("Unknown linkId " + linkId); return; }
+        startTcpReader(linkId, socket);
+        call.resolve();
     }
 
     private void readTcpLoop(int linkId, Socket socket) {
@@ -291,8 +370,11 @@ public class BastionNetworkPlugin extends Plugin {
         } catch (IOException e) {
             Log.i(TAG, "TCP connection closed with error, linkId=" + linkId, e);
         } finally {
-            tcpConnections.remove(linkId);
-            closeQuietly(socket);
+            synchronized (lifecycleLock) {
+                tcpConnections.remove(linkId, socket);
+                tcpReaders.remove(linkId);
+                closeQuietly(socket);
+            }
 
             JSObject result = new JSObject();
             result.put("linkId", linkId);
@@ -337,9 +419,17 @@ public class BastionNetworkPlugin extends Plugin {
             return;
         }
 
-        Socket socket = tcpConnections.remove(linkId);
-        if (socket != null) {
-            closeQuietly(socket);
+        synchronized (lifecycleLock) {
+            Socket socket = tcpConnections.remove(linkId);
+            if (socket != null) {
+                boolean readerStarted = tcpReaders.contains(linkId);
+                closeQuietly(socket);
+                if (!readerStarted) {
+                    JSObject result = new JSObject();
+                    result.put("linkId", linkId);
+                    notifyListeners("disconnectTCP", result);
+                }
+            }
         }
         call.resolve();
     }
@@ -349,6 +439,11 @@ public class BastionNetworkPlugin extends Plugin {
             socket.close();
         } catch (IOException e) {
             Log.e(TAG, "Socket close error", e);
+        } finally {
+            ParcelFileDescriptor borrowed = borrowedDescriptors.remove(socket);
+            if (borrowed != null) {
+                try { borrowed.close(); } catch (IOException e) { Log.e(TAG, "Descriptor close error", e); }
+            }
         }
     }
 }

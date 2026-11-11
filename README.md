@@ -50,6 +50,28 @@ TCP (`connectTCP`/`sendTCP`/`disconnectTCP`) работает всегда бе�
 - `portListTransmit` — порты, на которые уходит `sendBroadcastUDP` (на все локальные подсети). Без этого ключа `sendBroadcastUDP` вернёт reject.
 - `portListReceive` — порты, которые слушаются на входящие UDP-пакеты (`receiveUDP`). Без этого ключа слушатели просто не поднимаются (без ошибки — приложению, которому не нужен UDP, ничего делать не надо).
 
+TCP settings are optional. Existing callers can omit them:
+
+```json
+{
+  "plugins": {
+    "BastionNetworkPlugin": {
+      "portListTransmit": [23629, 47701],
+      "portListReceive": [23569, 21913],
+      "tcpConnectTimeoutMs": 10000,
+      "tcpNoDelay": true,
+      "tcpKeepAliveIdleSeconds": 3,
+      "tcpKeepAliveIntervalSeconds": 1,
+      "tcpKeepAliveProbeCount": 10
+    }
+  }
+}
+```
+
+`tcpConnectTimeoutMs` limits connection establishment and the initial write. `tcpNoDelay` controls TCP_NODELAY. The three keepalive values set the idle time, probe interval, and number of probes; set all three to positive integers to configure them, or omit them to use operating system defaults. Keepalive remains enabled. On Android the keepalive parameters use a bundled native library.
+
+To prevent events from arriving before a consumer registers the returned link, pass `deferEvents: true` to `connectTCP` and call `resumeTCP({ linkId })` when ready. Until then data remains in the socket receive buffer and the remote peer may be subject to TCP backpressure. Disconnecting a paused link closes it normally.
+
 ## API
 
 Все бинарные данные (UDP-датаграммы, TCP-пакеты) передаются как base64-строки.
@@ -68,7 +90,7 @@ await BastionNetworkPlugin.sendBroadcastUDP({ data: base64Data });
 const { linkId } = await BastionNetworkPlugin.connectTCP({
   ip: '192.168.1.50',
   port: 1234,
-  data: base64AuthToken,
+  data: base64InitialData,
 });
 
 await BastionNetworkPlugin.sendTCP({ linkId, data: base64Data });
